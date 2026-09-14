@@ -1,3 +1,5 @@
 requests>=2.31
 python-dotenv>=1.0
 tabulate>=0.9
+flask>=3.0
+gunicorn>=22.0

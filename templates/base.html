@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Seats.aero Dashboard{% endblock %}</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --card: #ffffff; --text: #1f1f1f; --muted: #6b6b6b;
+    --border: #e3e3e0; --accent: #b3541e; --accent-bg: #fdf3ea; --stripe: #fafaf8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151514; --card:#1e1e1c; --text:#eee; --muted:#9a9a95; --border:#333330; --accent:#e2984f; --accent-bg:#2a2015; --stripe:#1a1a18; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding: 24px 16px 48px; background: var(--bg); color: var(--text);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:baseline; gap: 10px 16px; margin-bottom: 20px; }
+  h1 { font-size: 1.3rem; margin: 0; }
+  nav { display:flex; flex-wrap:wrap; gap:4px; }
+  nav a { color: var(--text); text-decoration:none; padding: 6px 10px; border-radius:6px; font-size:0.88rem; white-space:nowrap; }
+  nav a:hover { background: var(--accent-bg); color: var(--accent); }
+  .card { background: var(--card); border:1px solid var(--border); border-radius:10px; padding: 18px 20px; margin-bottom:20px; }
+  .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 14px; display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; }
+  .btn { display:inline-block; background: var(--accent); color:#fff; padding:7px 14px; border-radius:7px;
+         text-decoration:none; font-size:0.85rem; border:none; cursor:pointer; }
+  .btn.secondary { background: transparent; color: var(--accent); border:1px solid var(--accent); }
+  table { border-collapse: collapse; width:100%; font-size:0.83rem; }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  tbody tr:nth-child(even) { background: var(--stripe); }
+  .overflow { overflow-x:auto; max-width:100%; }
+  .error { background:#fdeeee; color:#8a2c2c; border:1px solid #f0caca; padding:12px 16px; border-radius:8px; margin-bottom:16px; }
+  .empty { color: var(--muted); padding: 8px 0 4px; }
+  .route-group { margin-bottom: 24px; }
+  .route-group h3 { margin: 0 0 8px; font-size:1rem; }
+  .route-group h3 .n { color: var(--muted); font-weight:normal; font-size:0.85rem; }
+  .note { font-size:0.85rem; color: var(--muted); background: var(--stripe); border-radius:8px; padding:12px 16px; margin-top:16px; }
+  footer { color: var(--muted); font-size:0.8rem; margin-top:30px; text-align:center; }
+  ul.report-list { padding-left: 1.1em; line-height: 1.9; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Seats.aero Dashboard</h1>
+    <nav>
+      <a href="{{ url_for('index') }}">Home</a>
+      <a href="{{ url_for('report', report_id=1) }}">1. TPE Arrivals</a>
+      <a href="{{ url_for('report', report_id=2) }}">2. RIC/IAD Cheapest</a>
+      <a href="{{ url_for('report', report_id=3) }}">3. TPE Return</a>
+      <a href="{{ url_for('report', report_id=4) }}">4. RIC&harr;SMF</a>
+    </nav>
+  </header>
+  {% block content %}{% endblock %}
+  <footer>Data from the Seats.aero Partner API (cached tier). Not affiliated with Seats.aero.</footer>
+</div>
+</body>
+</html>

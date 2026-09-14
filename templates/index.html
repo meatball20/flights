@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p>Pick a report below. Each page loads whatever's cached (fast, free) and
+  has its own <strong>Refresh now</strong> button whenever you want the
+  latest data from Seats.aero.</p>
+  <ul class="report-list">
+    <li><a href="{{ url_for('report', report_id=1) }}">Report 1 &mdash; TPE arrivals from US gateways</a> (Dec 16&ndash;21, 2026)</li>
+    <li><a href="{{ url_for('report', report_id=2) }}">Report 2 &mdash; Cheapest routes from RIC/IAD</a> (next 30 days)</li>
+    <li><a href="{{ url_for('report', report_id=3) }}">Report 3 &mdash; TPE back to North America</a> (Dec 29, 2026 &ndash; Jan 3, 2027)</li>
+    <li><a href="{{ url_for('report', report_id=4) }}">Report 4 &mdash; RIC &harr; SMF self-connect deals</a> (next 3 months)</li>
+  </ul>
+</div>
+{% endblock %}

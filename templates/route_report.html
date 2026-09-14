@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="meta">
+    <span>{{ data.title if data else name }} &mdash; {{ data.start_date if data else '' }} to {{ data.end_date if data else '' }}</span>
+    {% if data %}<span>Last fetched: {{ data.generated_at or 'never (no data cached yet)' }}</span>{% endif %}
+    <a class="btn" href="{{ url_for('report', report_id=report_id, refresh=1) }}">Refresh now</a>
+    <a class="btn secondary" href="{{ url_for('report_csv', report_id=report_id) }}">Download CSV</a>
+  </div>
+
+  {% if error %}
+    <div class="error">Couldn't load this report: {{ error }}</div>
+  {% elif data %}
+    <h3>All cabins ({{ data.records|length }})</h3>
+    {% if data.records %}
+      <div class="overflow">
+      <table>
+        <thead><tr>{% for key, label in route_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for row in data.records %}
+          <tr>{% for key, label in route_columns %}<td>{{ row[key] }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty">No availability found.</p>
+    {% endif %}
+
+    <h3 style="margin-top:24px;">Business / First only ({{ data.premium_records|length }})</h3>
+    {% if data.premium_records %}
+      <div class="overflow">
+      <table>
+        <thead><tr>{% for key, label in route_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for row in data.premium_records %}
+          <tr>{% for key, label in route_columns %}<td>{{ row[key] }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty">No business/first availability found.</p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

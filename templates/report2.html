@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="meta">
+    <span>Top 25 cheapest distinct routes from RIC/IAD &mdash; {{ data.start_date if data else '' }} to {{ data.end_date if data else '' }}</span>
+    {% if data %}<span>Last fetched: {{ data.generated_at or 'never (no data cached yet)' }}</span>{% endif %}
+    <a class="btn" href="{{ url_for('report', report_id=2, refresh=1) }}">Refresh now</a>
+    <a class="btn secondary" href="{{ url_for('report_csv', report_id=2) }}">Download CSV</a>
+  </div>
+
+  {% if error %}
+    <div class="error">Couldn't load this report: {{ error }}</div>
+  {% elif data %}
+    {% if data.grouped_routes %}
+      {% for route in data.grouped_routes %}
+      <div class="route-group">
+        <h3>{{ loop.index }}. {{ route.origin }} &rarr; {{ route.destination }}
+          <span class="n">(cheapest {{ "{:,}".format(route.cheapest_miles) }} miles,
+          {{ route.subroutes|length }} price point{{ 's' if route.subroutes|length != 1 else '' }})</span>
+        </h3>
+        <div class="overflow">
+        <table>
+          <thead><tr>{% for key, label in subroute_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+          <tbody>
+            {% for sub in route.subroutes %}
+            <tr>{% for key, label in subroute_columns %}<td>{{ sub[key] }}</td>{% endfor %}</tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="empty">No availability found.</p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

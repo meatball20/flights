@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="meta">
+    <span>RIC &harr; SMF self-connect, 1 stop, {{ min_layover }}&ndash;{{ max_layover }} min layover
+      &mdash; {{ data.start_date if data else '' }} to {{ data.end_date if data else '' }}</span>
+    {% if data %}<span>Last fetched: {{ data.generated_at or 'never (no data cached yet)' }}</span>{% endif %}
+    <a class="btn" href="{{ url_for('report', report_id=4, refresh=1) }}">Refresh now</a>
+    <a class="btn secondary" href="{{ url_for('report_csv', report_id=4) }}">Download CSV</a>
+  </div>
+
+  {% if error %}
+    <div class="error">Couldn't load this report: {{ error }}</div>
+  {% elif data %}
+    <p class="meta" style="margin-bottom:8px;">
+      Checked {{ data.candidates_checked }} of {{ data.candidates_total }} candidate same-day leg pairs found.
+    </p>
+    {% if data.results %}
+      <div class="overflow">
+      <table>
+        <thead><tr>{% for key, label in self_connect_columns %}<th>{{ label }}</th>{% endfor %}</tr></thead>
+        <tbody>
+          {% for row in data.results %}
+          <tr>{% for key, label in self_connect_columns %}<td>{{ row[key] }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+    {% else %}
+      <p class="empty">No valid 1-stop connections found within the layover window.</p>
+    {% endif %}
+
+    <p class="note">These are two separately-ticketed award bookings you'd connect yourself, not one
+      protected itinerary. If leg 1 is delayed, leg 2 isn't held for you and isn't refunded automatically.
+      Departure/arrival times shown are time-of-day from a checked date; always re-verify the exact
+      schedule for the date you book.</p>
+  {% endif %}
+</div>
+{% endblock %}
