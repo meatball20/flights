@@ -1,16 +1,30 @@
 # Seats.aero award availability reporter
 
 A small command-line script that queries the Seats.aero Partner API
-(cached-data tier, Pro key) and prints two reports:
+(cached-data tier, Pro key) and prints four reports:
 
 1. **TPE arrivals** from major US gateways, Dec 16-21 2026, all cabins,
    business/first flagged separately.
 2. **Cheapest award routes** departing RIC or IAD in the next 30 days
-   (top 25 by miles).
+   (top 25 distinct routes by miles).
+3. **TPE back to North America**, Dec 29 2026 - Jan 3 2027 (the return leg),
+   same all-cabins / business-first breakdown as report 1.
+4. **RIC <-> SMF self-connect deals**: since seats.aero likely has no
+   direct cached data for that specific small-airport pair, this searches
+   RIC and SMF each against a list of major US hubs, matches up same-day
+   legs, then looks up each leg's *real* flight times (a separate API
+   endpoint) to confirm a genuine 1-stop connection with a 45min-3h
+   layover exists. Covers the next 3 months.
 
-Both reports print as tables in the terminal and are written to CSV files
-in `output/`. Raw API responses are cached as JSON in `cache/` so you can
+All reports print as tables in the terminal and are written to CSV files in
+`output/`. Raw API responses are cached as JSON in `cache/` so you can
 re-run the analysis without spending API quota.
+
+**Duplicate routes are collapsed.** A 30-day or 3-month search naturally
+finds the same route at the same price on many different dates. Instead of
+printing 20 nearly-identical rows, each report groups by
+route+program+cabin+price and shows one row with every matching date listed
+in a "Dates" column (truncated with a "+N more" note if there are a lot).
 
 ## Install
 
@@ -89,3 +103,16 @@ Pro-tier quota.
   against a curated list of ~70 major airports worldwide as a practical
   stand-in for "anywhere" - see `REPORT2_DESTINATIONS` in the script if
   you want to edit that list.
+- Report 4 also uses the **Get Trips** endpoint (`GET
+  /partnerapi/trips/{id}`) to fetch real flight departure/arrival times for
+  each candidate leg - Cached Search's summary rows only say a cabin is
+  available on a date, not what time. This costs one extra API call per
+  leg checked, capped at `SELF_CONNECT_MAX_LOOKUPS` (default 60) cheapest
+  candidates so quota use stays predictable; increase it in the script if
+  you want a deeper search.
+- Report 4's connections are **two separately-ticketed award bookings**,
+  not one protected itinerary - if the first flight runs late, the second
+  isn't held or refunded for you. A `SELF_CONNECT_MIN_LAYOVER_MIN` (default
+  45 minutes) is enforced in addition to your 3-hour max, since a shorter
+  self-transfer generally isn't realistically bookable. Both constants are
+  easy to change at the top of the script.

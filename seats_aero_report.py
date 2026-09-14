@@ -2,13 +2,16 @@
 """
 Seats.aero award availability reporter (Pro/cached-data tier).
 
-Runs two reports against the Seats.aero Partner API "Cached Search" endpoint
-(GET /partnerapi/search) and prints readable tables + writes CSVs:
+Runs four reports against the Seats.aero Partner API and prints readable
+tables + writes CSVs:
 
   Report 1 - Flights arriving TPE from major US gateways, Dec 16-21 2026.
   Report 2 - Cheapest award routes departing RIC or IAD in the next 30 days.
+  Report 3 - Flights from TPE back to North America, Dec 29 2026 - Jan 3 2027.
+  Report 4 - RIC <-> SMF self-connect deals (1 stop, <=3h layover) in the
+             next 3 months.
 
-Why Cached Search (and not Bulk Availability) for both reports
+Why Cached Search (and not Bulk Availability) for reports 1-3
 ----------------------------------------------------------------
 Seats.aero's Partner API has two cached-data endpoints:
 
@@ -18,16 +21,28 @@ Seats.aero's Partner API has two cached-data endpoints:
     mileage program at a time (filtered by broad origin/destination
     *region*, not by specific airport).
 
-Both reports here ask for a handful of specific origin airports searched
-against every mileage program at once, which is exactly what Cached Search
-is built for. Bulk Availability would need one API call per mileage program
-(there are ~25+) and doesn't accept a specific-airport filter, so it would
-burn far more of your daily quota for a worse fit. That's a Pro-tier
-distinction, confirmed against the public API docs/reference before writing
-any code - see the note at the bottom of this file for links.
+Reports 1-3 ask for a handful of specific origin airports searched against
+every mileage program at once, which is exactly what Cached Search is built
+for. Bulk Availability would need one API call per mileage program (there
+are ~25+) and doesn't accept a specific-airport filter, so it would burn far
+more of your daily quota for a worse fit.
+
+Report 4 needs something extra: actual flight *times*, so it can check a
+real layover window. Cached Search's summary rows don't include times, so
+for that report we also call the "Get Trips" endpoint (GET
+/partnerapi/trips/{id}) which returns real departure/arrival times per
+flight segment for a given availability row. See run_report4() below for
+how that's used.
 
 Live Search (real-time, commercial-only) is never used here - Pro keys only
 get cached/bulk data, per the task requirements.
+
+Docs consulted (Pro/cached-tier endpoints only):
+  https://developers.seats.aero/reference/cached-search
+  https://developers.seats.aero/reference/get-availability   (Bulk Availability)
+  https://developers.seats.aero/reference/get-trips
+  https://developers.seats.aero/reference/getting-started-p  (auth header)
+  https://docs.seats.aero/article/68-seatsaero-pro-api-access-limits-and-usage
 """
 
 import csv
@@ -35,7 +50,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -61,6 +76,7 @@ load_dotenv(SCRIPT_DIR / ".env")
 
 BASE_URL = "https://seats.aero/partnerapi"
 SEARCH_URL = f"{BASE_URL}/search"
+TRIPS_URL = f"{BASE_URL}/trips"
 
 # Pagination: the API returns up to `take` rows per call and tells us if
 # there's more via "hasMore" + a "cursor" to pass on the next call. We cap
@@ -122,6 +138,40 @@ REPORT2_DESTINATIONS = [
     "SYD", "MEL", "BNE", "AKL", "NAN",
 ]
 REPORT2_TOP_N = 25
+
+# Report 3: the return leg - TPE back to North America. Reuses report 1's
+# gateway list (same US airports, now as destinations) plus a few Canada/
+# Mexico gateways, for the same "no true wildcard, so use a broad curated
+# list" reason as report 2.
+REPORT3_ORIGIN = "TPE"
+REPORT3_DESTINATIONS = REPORT1_ORIGINS + ["YYZ", "YVR", "YUL", "YYC", "MEX", "CUN"]
+REPORT3_START = "2026-12-29"
+REPORT3_END = "2027-01-03"
+
+# Report 4: RIC <-> SMF is a small-airport pair that seats.aero's cached
+# database usually won't have a direct row for (it only caches the route
+# pairs its crawler actually searches, which skews toward routes people
+# commonly search). So instead of searching RIC->SMF directly, we search
+# RIC and SMF each against a list of major US hub airports that plausibly
+# connect them, then match up same-day legs ourselves - i.e. exactly the
+# "browse and add them up yourself" approach, automated.
+SELF_CONNECT_AIRPORTS = ("RIC", "SMF")
+SELF_CONNECT_HUBS = [
+    "ORD", "DFW", "ATL", "DEN", "IAH", "CLT", "PHX", "SLC", "MSP", "LAS",
+    "SEA", "EWR", "JFK", "PHL", "DTW", "LAX", "SFO",
+]
+SELF_CONNECT_MAX_LAYOVER_MIN = 180  # your "3 hours is the longest" rule
+# Not requested, but added as a sanity floor: a same-day self-transfer under
+# ~45 minutes generally isn't realistically bookable/safe (these are two
+# *separate* award tickets, not one protected itinerary - no rebooking if
+# leg 1 runs late). Change/remove SELF_CONNECT_MIN_LAYOVER_MIN if you'd
+# rather see those too.
+SELF_CONNECT_MIN_LAYOVER_MIN = 45
+# How many of the cheapest same-day leg-pairs we'll spend extra API calls on
+# to verify with real flight times (Get Trips costs one call per leg looked
+# up). Keeps quota use predictable even if there turn out to be hundreds of
+# candidate date/hub combinations.
+SELF_CONNECT_MAX_LOOKUPS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +270,69 @@ def cached_search(api_key, origin_airport, destination_airport, start_date,
     return all_rows
 
 
+def get_trip_options(api_key, availability_id, refresh=False):
+    """Call Get Trips (GET /partnerapi/trips/{id}) for one availability row
+    and return its actual flight-level options: a list of dicts with
+    departs_at / arrives_at (real datetimes), cabin, and stops.
+
+    An availability row from Cached Search is a *summary* (e.g. "Economy
+    available on this date for 70,000 miles") - it doesn't say what time
+    the flight leaves. Get Trips looks up the real flight(s) behind one
+    summary row. There can be more than one (e.g. two flight-time options
+    on the same date/cabin/price), which is why this returns a list.
+
+    Cached like cached_search(): one small JSON file per availability ID.
+    """
+    if not availability_id:
+        return []
+
+    cache_file = CACHE_DIR / f"trip_{availability_id}.json"
+    if cache_file.exists() and not refresh:
+        with open(cache_file) as f:
+            payload = json.load(f)
+    else:
+        headers = {
+            "Partner-Authorization": api_key,
+            "Accept": "application/json",
+        }
+        url = f"{TRIPS_URL}/{availability_id}"
+        response = requests.get(url, headers=headers, timeout=30)
+        log_remaining_quota(response)
+        if response.status_code != 200:
+            print(f"  [warn] Get Trips failed ({response.status_code}) for "
+                  f"{availability_id}; skipping this leg.")
+            return []
+        payload = response.json()
+        with open(cache_file, "w") as f:
+            json.dump(payload, f)
+
+    options = []
+    for trip in payload.get("data", []):
+        departs = parse_iso_datetime(trip.get("DepartsAt"))
+        arrives = parse_iso_datetime(trip.get("ArrivesAt"))
+        if departs is None or arrives is None:
+            continue
+        options.append({
+            "departs_at": departs,
+            "arrives_at": arrives,
+            "cabin": trip.get("Cabin", ""),
+            "stops": trip.get("Stops", 0),
+        })
+    return options
+
+
+def parse_iso_datetime(value):
+    """Parse an ISO-8601 timestamp like '2026-12-16T08:15:00Z' safely
+    across Python versions (older versions' datetime.fromisoformat doesn't
+    accept a trailing 'Z')."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Turning raw API rows into per-cabin records we can sort/print/export
 # ---------------------------------------------------------------------------
@@ -238,7 +351,7 @@ def explode_rows(raw_rows):
 
     Each raw row looks roughly like:
       {
-        "Date": "2026-12-16",
+        "ID": "abc123", "Date": "2026-12-16",
         "Route": {"OriginAirport": "SFO", "DestinationAirport": "TPE"},
         "Source": "united",
         "YAvailable": true, "YMileageCostRaw": 70000, "YRemainingSeats": 2,
@@ -246,6 +359,8 @@ def explode_rows(raw_rows):
         ... (same pattern repeated for W, J, F) ...
       }
     We flatten that into up to 4 separate records, one per available cabin.
+    "id" is kept on each record because report 4 needs it to look up real
+    flight times via Get Trips.
     """
     records = []
     for row in raw_rows:
@@ -265,6 +380,8 @@ def explode_rows(raw_rows):
             nonstop = row.get(f"{cabin_code}Direct")
 
             records.append({
+                "id": row.get("ID", ""),
+                "cabin_code": cabin_code,
                 "program": program,
                 "miles": miles,
                 "taxes": format_money(taxes_cents, currency),
@@ -278,6 +395,51 @@ def explode_rows(raw_rows):
                 "routing": "Nonstop" if nonstop else "Connecting",
             })
     return records
+
+
+# ---------------------------------------------------------------------------
+# De-duplicating repeated route/price rows across many dates
+# ---------------------------------------------------------------------------
+
+def format_dates_list(dates, max_shown=6):
+    """'2026-12-16, 2026-12-17, ... (+9 more)' style summary of a date list."""
+    dates = sorted(dates)
+    if len(dates) <= max_shown:
+        return ", ".join(dates)
+    shown = ", ".join(dates[:max_shown])
+    return f"{shown} (+{len(dates) - max_shown} more)"
+
+
+def collapse_duplicate_routes(records, key_fields):
+    """Merge records that are the *same route at the same price* on
+    different dates into a single row with a combined "dates" field.
+
+    Without this, a 30-day search naturally returns the same route/program/
+    price repeated on many dates - e.g. "United SFO->TPE Economy 70,000
+    miles" showing up as 15 nearly-identical rows, one per date. This groups
+    those by `key_fields` (a tuple of record keys, e.g. program/cabin/
+    origin/destination/miles/taxes) and keeps one row per unique
+    combination, listing every date it's available under a "dates" field.
+    Seats shown is the best (max) seen across the group, since that's the
+    most you could actually book on your best date.
+    """
+    groups = {}
+    for r in records:
+        key = tuple(r[f] for f in key_fields)
+        group = groups.setdefault(key, {**r, "_dates": set(), "_seats": []})
+        group["_dates"].add(r["date"])
+        if r.get("seats") is not None:
+            group["_seats"].append(r["seats"])
+
+    collapsed = []
+    for group in groups.values():
+        group["dates"] = format_dates_list(group["_dates"])
+        group["date_count"] = len(group["_dates"])
+        group["seats"] = max(group["_seats"]) if group["_seats"] else None
+        del group["_dates"]
+        del group["_seats"]
+        collapsed.append(group)
+    return collapsed
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +465,31 @@ def write_csv(records, columns, path):
     print(f"[csv] Wrote {len(records)} rows to {path}")
 
 
+# Standard column layout shared by reports 1-3 (all deduplicated, one row
+# per unique route+price with a combined "dates" column).
+ROUTE_DEDUPE_KEY = ("program", "cabin", "origin", "destination", "miles", "taxes")
+ROUTE_COLUMNS = [
+    ("program", "Program"),
+    ("miles", "Miles"),
+    ("taxes", "Taxes/Fees"),
+    ("cabin", "Cabin"),
+    ("seats", "Seats"),
+    ("origin", "Origin"),
+    ("destination", "Destination"),
+    ("dates", "Dates"),
+    ("routing", "Routing"),
+]
+
+
+def build_route_report(raw_rows, sort_and_dedupe=True):
+    """Shared pipeline for reports 1-3: explode -> dedupe -> sort by miles."""
+    records = explode_rows(raw_rows)
+    records = collapse_duplicate_routes(records, ROUTE_DEDUPE_KEY)
+    if sort_and_dedupe:
+        records.sort(key=lambda r: (r["miles"] is None, r["miles"]))
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Report 1: TPE arrivals from US gateways, Dec 16-21 2026
 # ---------------------------------------------------------------------------
@@ -320,27 +507,16 @@ def run_report1(api_key, refresh):
         cache_key=cache_key,
         refresh=refresh,
     )
-    records = explode_rows(raw_rows)
-    records.sort(key=lambda r: (r["miles"] is None, r["miles"]))
+    records = build_route_report(raw_rows)
 
-    columns = [
-        ("program", "Program"),
-        ("miles", "Miles"),
-        ("taxes", "Taxes/Fees"),
-        ("cabin", "Cabin"),
-        ("seats", "Seats"),
-        ("origin", "Origin"),
-        ("date", "Date"),
-        ("routing", "Routing"),
-    ]
-
-    print_table(records, columns, "REPORT 1: All cabins - TPE arrivals from US gateways (Dec 16-21, 2026)")
-    write_csv(records, columns, OUTPUT_DIR / "report1_tpe_all_cabins.csv")
+    print_table(records, ROUTE_COLUMNS,
+                "REPORT 1: All cabins - TPE arrivals from US gateways (Dec 16-21, 2026)")
+    write_csv(records, ROUTE_COLUMNS, OUTPUT_DIR / "report1_tpe_all_cabins.csv")
 
     premium_records = [r for r in records if r["premium_cabin"]]
-    print_table(premium_records, columns,
+    print_table(premium_records, ROUTE_COLUMNS,
                 "REPORT 1: Business/First only - TPE arrivals from US gateways")
-    write_csv(premium_records, columns, OUTPUT_DIR / "report1_tpe_business_first.csv")
+    write_csv(premium_records, ROUTE_COLUMNS, OUTPUT_DIR / "report1_tpe_business_first.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -365,28 +541,203 @@ def run_report2(api_key, refresh):
         cache_key=cache_key,
         refresh=refresh,
     )
-    records = explode_rows(raw_rows)
-    records.sort(key=lambda r: (r["miles"] is None, r["miles"]))
+    records = build_route_report(raw_rows)
     top_records = records[:REPORT2_TOP_N]
 
-    columns = [
-        ("destination", "Destination"),
-        ("date", "Date"),
-        ("miles", "Miles"),
-        ("taxes", "Taxes/Fees"),
-        ("cabin", "Cabin"),
-        ("program", "Program"),
-        ("seats", "Seats"),
-        ("origin", "Origin"),
-        ("routing", "Routing"),
-    ]
-
-    print_table(top_records, columns,
-                f"REPORT 2: Top {REPORT2_TOP_N} cheapest routes from RIC/IAD "
-                f"({start_date} to {end_date})")
+    print_table(top_records, ROUTE_COLUMNS,
+                f"REPORT 2: Top {REPORT2_TOP_N} cheapest DISTINCT routes from "
+                f"RIC/IAD ({start_date} to {end_date})")
     # The CSV holds everything we found, not just the printed top N, in case
     # you want to explore beyond the top 25 later without re-querying.
-    write_csv(records, columns, OUTPUT_DIR / "report2_ric_iad_cheapest.csv")
+    write_csv(records, ROUTE_COLUMNS, OUTPUT_DIR / "report2_ric_iad_cheapest.csv")
+
+
+# ---------------------------------------------------------------------------
+# Report 3: TPE back to North America, Dec 29 2026 - Jan 3 2027
+# ---------------------------------------------------------------------------
+
+def run_report3(api_key, refresh):
+    destination_str = ",".join(REPORT3_DESTINATIONS)
+    cache_key = f"report3_{REPORT3_ORIGIN}_{REPORT3_START}_{REPORT3_END}"
+
+    raw_rows = cached_search(
+        api_key,
+        origin_airport=REPORT3_ORIGIN,
+        destination_airport=destination_str,
+        start_date=REPORT3_START,
+        end_date=REPORT3_END,
+        cache_key=cache_key,
+        refresh=refresh,
+    )
+    records = build_route_report(raw_rows)
+
+    print_table(records, ROUTE_COLUMNS,
+                "REPORT 3: All cabins - TPE back to North America (Dec 29, 2026 - Jan 3, 2027)")
+    write_csv(records, ROUTE_COLUMNS, OUTPUT_DIR / "report3_tpe_return_all_cabins.csv")
+
+    premium_records = [r for r in records if r["premium_cabin"]]
+    print_table(premium_records, ROUTE_COLUMNS,
+                "REPORT 3: Business/First only - TPE back to North America")
+    write_csv(premium_records, ROUTE_COLUMNS, OUTPUT_DIR / "report3_tpe_return_business_first.csv")
+
+
+# ---------------------------------------------------------------------------
+# Report 4: RIC <-> SMF self-connect deals, next 3 months, 1 stop, <=3h
+# ---------------------------------------------------------------------------
+
+def find_same_day_connections(leg1_records, leg2_records):
+    """Pair up leg1 (origin->hub) and leg2 (hub->destination) records that
+    share a hub airport and travel date. Returns a list of (leg1, leg2)
+    candidate pairs, cheapest combined mileage first.
+
+    This is the "browse and add them up yourself" step, automated: we don't
+    ask the API for RIC->SMF directly (it likely has no cached rows for
+    that specific pair - it's not a route people commonly search). Instead
+    we find every RIC->HUB row and every HUB->SMF row and match same-date
+    pairs that share a hub.
+    """
+    # Index leg2 by (hub, date) for fast lookup while scanning leg1.
+    leg2_by_hub_date = {}
+    for r in leg2_records:
+        leg2_by_hub_date.setdefault((r["origin"], r["date"]), []).append(r)
+
+    pairs = []
+    for leg1 in leg1_records:
+        for leg2 in leg2_by_hub_date.get((leg1["destination"], leg1["date"]), []):
+            pairs.append((leg1, leg2))
+
+    pairs.sort(key=lambda p: p[0]["miles"] + p[1]["miles"])
+    return pairs
+
+
+def verify_layover(api_key, leg1, leg2, refresh):
+    """Look up real flight times for both legs (via Get Trips) and check
+    for at least one nonstop-per-leg combination with a layover between
+    SELF_CONNECT_MIN_LAYOVER_MIN and SELF_CONNECT_MAX_LAYOVER_MIN minutes.
+
+    Returns a dict describing the best valid connection found, or None if
+    no combination of real flight times works.
+    """
+    leg1_options = [o for o in get_trip_options(api_key, leg1["id"], refresh)
+                    if o["stops"] == 0]
+    leg2_options = [o for o in get_trip_options(api_key, leg2["id"], refresh)
+                    if o["stops"] == 0]
+
+    best = None
+    for opt1 in leg1_options:
+        for opt2 in leg2_options:
+            layover_min = (opt2["departs_at"] - opt1["arrives_at"]).total_seconds() / 60
+            if SELF_CONNECT_MIN_LAYOVER_MIN <= layover_min <= SELF_CONNECT_MAX_LAYOVER_MIN:
+                if best is None or layover_min < best["layover_min"]:
+                    best = {
+                        "layover_min": round(layover_min),
+                        "leg1_departs": opt1["departs_at"],
+                        "leg1_arrives": opt1["arrives_at"],
+                        "leg2_departs": opt2["departs_at"],
+                        "leg2_arrives": opt2["arrives_at"],
+                    }
+    return best
+
+
+def run_report4(api_key, refresh):
+    today = date.today()
+    start_date = today.isoformat()
+    end_date = (today + timedelta(days=90)).isoformat()
+    hub_str = ",".join(SELF_CONNECT_HUBS)
+    origin_a, origin_b = SELF_CONNECT_AIRPORTS
+
+    def search(origin, destination, tag):
+        cache_key = f"report4_{tag}_{start_date}_{end_date}"
+        raw = cached_search(api_key, origin, destination, start_date, end_date,
+                             cache_key=cache_key, refresh=refresh)
+        return explode_rows(raw)
+
+    # Four cached-search calls: each direction's two legs.
+    a_to_hub = search(origin_a, hub_str, f"{origin_a}_to_hubs")
+    hub_to_b = search(hub_str, origin_b, f"hubs_to_{origin_b}")
+    b_to_hub = search(origin_b, hub_str, f"{origin_b}_to_hubs")
+    hub_to_a = search(hub_str, origin_a, f"hubs_to_{origin_a}")
+
+    candidates = (
+        [("->".join(SELF_CONNECT_AIRPORTS), p) for p in find_same_day_connections(a_to_hub, hub_to_b)]
+        + [("->".join(reversed(SELF_CONNECT_AIRPORTS)), p) for p in find_same_day_connections(b_to_hub, hub_to_a)]
+    )
+    candidates.sort(key=lambda c: c[1][0]["miles"] + c[1][1]["miles"])
+
+    print(f"\n[info] Found {len(candidates)} same-day leg-pair candidates via "
+          f"{len(SELF_CONNECT_HUBS)} hub airports; checking real flight times "
+          f"for the cheapest {min(len(candidates), SELF_CONNECT_MAX_LOOKUPS)} "
+          f"of them (Get Trips lookups, cached per flight so re-runs are free).")
+
+    results = []
+    checked = 0
+    for direction, (leg1, leg2) in candidates:
+        if checked >= SELF_CONNECT_MAX_LOOKUPS:
+            break
+        checked += 1
+        connection = verify_layover(api_key, leg1, leg2, refresh)
+        if connection is None:
+            continue
+        results.append({
+            "direction": direction,
+            "hub": leg1["destination"],
+            "leg1_program": leg1["program"],
+            "leg1_cabin": leg1["cabin"],
+            "leg1_miles": leg1["miles"],
+            "leg1_taxes": leg1["taxes"],
+            "leg2_program": leg2["program"],
+            "leg2_cabin": leg2["cabin"],
+            "leg2_miles": leg2["miles"],
+            "leg2_taxes": leg2["taxes"],
+            "total_miles": leg1["miles"] + leg2["miles"],
+            "seats": min(leg1["seats"] or 0, leg2["seats"] or 0),
+            "layover_min": connection["layover_min"],
+            "leg1_depart_time": connection["leg1_departs"].strftime("%H:%M"),
+            "leg1_arrive_time": connection["leg1_arrives"].strftime("%H:%M"),
+            "leg2_depart_time": connection["leg2_departs"].strftime("%H:%M"),
+            "leg2_arrive_time": connection["leg2_arrives"].strftime("%H:%M"),
+            "date": leg1["date"],
+        })
+
+    # Same idea as reports 1-3: the same connection (same flights, same
+    # price) tends to repeat across many dates, so collapse those into one
+    # row with a combined dates list instead of showing every date.
+    dedupe_key = ("direction", "hub", "leg1_program", "leg1_cabin", "leg1_miles",
+                  "leg2_program", "leg2_cabin", "leg2_miles", "layover_min")
+    results = collapse_duplicate_routes(results, dedupe_key)
+    results.sort(key=lambda r: r["total_miles"])
+
+    columns = [
+        ("direction", "Direction"),
+        ("hub", "Via"),
+        ("total_miles", "Total Miles"),
+        ("leg1_program", "Leg 1 Program"),
+        ("leg1_cabin", "Leg 1 Cabin"),
+        ("leg1_miles", "Leg 1 Miles"),
+        ("leg1_taxes", "Leg 1 Taxes"),
+        ("leg1_depart_time", "Leg 1 Departs"),
+        ("leg1_arrive_time", "Leg 1 Arrives"),
+        ("layover_min", "Layover (min)"),
+        ("leg2_program", "Leg 2 Program"),
+        ("leg2_cabin", "Leg 2 Cabin"),
+        ("leg2_miles", "Leg 2 Miles"),
+        ("leg2_taxes", "Leg 2 Taxes"),
+        ("leg2_depart_time", "Leg 2 Departs"),
+        ("leg2_arrive_time", "Leg 2 Arrives"),
+        ("seats", "Min Seats"),
+        ("dates", "Dates"),
+    ]
+
+    print_table(results, columns,
+                f"REPORT 4: RIC <-> SMF self-connect deals, 1 stop, "
+                f"{SELF_CONNECT_MIN_LAYOVER_MIN}-{SELF_CONNECT_MAX_LAYOVER_MIN} min "
+                f"layover ({start_date} to {end_date})")
+    print("\n  NOTE: these are two separately-ticketed award bookings you'd "
+          "connect yourself, not one protected itinerary. If leg 1 is "
+          "delayed, leg 2 isn't held for you and isn't refunded automatically. "
+          "Departure/arrival times shown are time-of-day from a checked "
+          "date; always re-verify the exact schedule for the date you book.")
+    write_csv(results, columns, OUTPUT_DIR / "report4_ric_smf_self_connect.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -403,18 +754,11 @@ def main():
 
     run_report1(api_key, refresh)
     run_report2(api_key, refresh)
+    run_report3(api_key, refresh)
+    run_report4(api_key, refresh)
 
     print(f"\nDone. CSVs written to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
     main()
-
-# ---------------------------------------------------------------------------
-# Docs consulted (Pro/cached-tier endpoints only; Live Search intentionally
-# not used - it's commercial-only and rejects Pro keys):
-#   https://developers.seats.aero/reference/cached-search
-#   https://developers.seats.aero/reference/get-availability   (Bulk Availability)
-#   https://developers.seats.aero/reference/getting-started-p  (auth header)
-#   https://docs.seats.aero/article/68-seatsaero-pro-api-access-limits-and-usage
-# ---------------------------------------------------------------------------
