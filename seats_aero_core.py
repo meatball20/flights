@@ -36,10 +36,19 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CACHE_DIR = SCRIPT_DIR / "cache"
-OUTPUT_DIR = SCRIPT_DIR / "output"
-CACHE_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
+
+# On a normal host (your machine, Render) the project folder is writable, so
+# cache/ and output/ live right next to this script. Some hosts (e.g.
+# Vercel's serverless functions) only allow writing to /tmp - if you ever
+# deploy there, set VERCEL=1 (Vercel sets it automatically) to switch.
+if os.environ.get("VERCEL"):
+    CACHE_DIR = Path("/tmp/seats_aero_cache")
+    OUTPUT_DIR = Path("/tmp/seats_aero_output")
+else:
+    CACHE_DIR = SCRIPT_DIR / "cache"
+    OUTPUT_DIR = SCRIPT_DIR / "output"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # python-dotenv reads a .env file (if present) and loads its KEY=VALUE lines
 # into the environment. Locally this lets SEATS_AERO_API_KEY live in a .env
@@ -122,8 +131,10 @@ SELF_CONNECT_MIN_LAYOVER_MIN = 45
 # How many of the cheapest same-day leg-pairs we'll spend extra API calls on
 # to verify with real flight times (Get Trips costs one call per leg looked
 # up). Keeps quota use predictable even if there turn out to be hundreds of
-# candidate date/hub combinations.
-SELF_CONNECT_MAX_LOOKUPS = 60
+# candidate date/hub combinations. Overridable via an env var if you ever
+# want to tune it without editing code (e.g. lower it on a host with a
+# request time limit).
+SELF_CONNECT_MAX_LOOKUPS = int(os.environ.get("SELF_CONNECT_MAX_LOOKUPS", "60"))
 
 
 # ---------------------------------------------------------------------------
