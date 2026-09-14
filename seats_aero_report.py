@@ -465,6 +465,94 @@ def write_csv(records, columns, path):
     print(f"[csv] Wrote {len(records)} rows to {path}")
 
 
+# ---------------------------------------------------------------------------
+# Grouping price points under one row per physical route (origin+destination)
+# ---------------------------------------------------------------------------
+
+SUBROUTE_COLUMNS = [
+    ("program", "Program"),
+    ("cabin", "Cabin"),
+    ("miles", "Miles"),
+    ("taxes", "Taxes/Fees"),
+    ("seats", "Seats"),
+    ("dates", "Dates"),
+    ("routing", "Routing"),
+]
+
+
+def group_by_route(records, top_n):
+    """Group already-deduplicated price-point records by (origin,
+    destination) so each physical route appears once, with its different
+    price points (program/cabin/miles combos) nested underneath as "sub
+    routes" instead of each being its own top-level row.
+
+    `records` is expected to already be the output of
+    collapse_duplicate_routes() - i.e. one record per unique route+program+
+    cabin+price, dates already combined. This just does one more level of
+    grouping on top of that: by route alone.
+
+    Returns the `top_n` cheapest routes (ranked by each route's own
+    cheapest sub route), each as a dict with "origin", "destination", and
+    "subroutes" (sorted cheapest-first).
+    """
+    routes = {}
+    for r in records:
+        key = (r["origin"], r["destination"])
+        routes.setdefault(key, []).append(r)
+
+    grouped = []
+    for (origin, destination), subroutes in routes.items():
+        subroutes.sort(key=lambda r: (r["miles"] is None, r["miles"]))
+        grouped.append({
+            "origin": origin,
+            "destination": destination,
+            "cheapest_miles": subroutes[0]["miles"],
+            "subroutes": subroutes,
+        })
+
+    grouped.sort(key=lambda g: (g["cheapest_miles"] is None, g["cheapest_miles"]))
+    return grouped[:top_n]
+
+
+def print_grouped_routes(grouped, subroute_columns, title):
+    """Print one route per group, with its sub routes tab-indented beneath
+    it - the "route [tab] sub routes" layout."""
+    print(f"\n{'=' * len(title)}\n{title}\n{'=' * len(title)}")
+    if not grouped:
+        print("(no availability found)")
+        return
+    for i, route in enumerate(grouped, start=1):
+        print(f"\n{i}. {route['origin']} -> {route['destination']} "
+              f"(cheapest: {route['cheapest_miles']:,} miles, "
+              f"{len(route['subroutes'])} price point"
+              f"{'s' if len(route['subroutes']) != 1 else ''})")
+        headers = [c[1] for c in subroute_columns]
+        rows = [[sub[c[0]] for c in subroute_columns] for sub in route["subroutes"]]
+        table = tabulate(rows, headers=headers, tablefmt="github")
+        for line in table.splitlines():
+            print(f"\t{line}")
+
+
+def write_grouped_csv(grouped, subroute_columns, path):
+    """Write one CSV row per sub route, with a leading Route column that's
+    only filled in on each route's first row (blank on the rest) - the
+    same "route, then its sub routes underneath" grouping, spreadsheet
+    style."""
+    row_count = 0
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Route"] + [c[1] for c in subroute_columns])
+        for route in grouped:
+            route_label = f"{route['origin']} -> {route['destination']}"
+            for j, sub in enumerate(route["subroutes"]):
+                writer.writerow(
+                    [route_label if j == 0 else ""]
+                    + [sub[c[0]] for c in subroute_columns]
+                )
+                row_count += 1
+    print(f"[csv] Wrote {len(grouped)} routes ({row_count} price-point rows) to {path}")
+
+
 # Standard column layout shared by reports 1-3 (all deduplicated, one row
 # per unique route+price with a combined "dates" column).
 ROUTE_DEDUPE_KEY = ("program", "cabin", "origin", "destination", "miles", "taxes")
@@ -542,14 +630,19 @@ def run_report2(api_key, refresh):
         refresh=refresh,
     )
     records = build_route_report(raw_rows)
-    top_records = records[:REPORT2_TOP_N]
+    # One row per unique (origin, destination) route, with its different
+    # program/cabin/price combinations nested underneath as sub routes -
+    # so e.g. RIC->LAX counts as ONE of the 25 routes even though it might
+    # have 4 different mileage programs/cabins pricing it differently.
+    grouped_routes = group_by_route(records, REPORT2_TOP_N)
 
-    print_table(top_records, ROUTE_COLUMNS,
-                f"REPORT 2: Top {REPORT2_TOP_N} cheapest DISTINCT routes from "
-                f"RIC/IAD ({start_date} to {end_date})")
-    # The CSV holds everything we found, not just the printed top N, in case
-    # you want to explore beyond the top 25 later without re-querying.
-    write_csv(records, ROUTE_COLUMNS, OUTPUT_DIR / "report2_ric_iad_cheapest.csv")
+    print_grouped_routes(
+        grouped_routes, SUBROUTE_COLUMNS,
+        f"REPORT 2: Top {REPORT2_TOP_N} cheapest DISTINCT routes from "
+        f"RIC/IAD ({start_date} to {end_date})",
+    )
+    write_grouped_csv(grouped_routes, SUBROUTE_COLUMNS,
+                       OUTPUT_DIR / "report2_ric_iad_cheapest.csv")
 
 
 # ---------------------------------------------------------------------------

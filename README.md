@@ -5,8 +5,11 @@ A small command-line script that queries the Seats.aero Partner API
 
 1. **TPE arrivals** from major US gateways, Dec 16-21 2026, all cabins,
    business/first flagged separately.
-2. **Cheapest award routes** departing RIC or IAD in the next 30 days
-   (top 25 distinct routes by miles).
+2. **Cheapest award routes** departing RIC or IAD in the next 30 days -
+   the 25 cheapest distinct *routes* (by origin/destination airport pair).
+   Each route is printed once with its different mileage-program/cabin
+   price points nested underneath as tab-indented "sub routes", instead of
+   repeating the same route once per price point.
 3. **TPE back to North America**, Dec 29 2026 - Jan 3 2027 (the return leg),
    same all-cabins / business-first breakdown as report 1.
 4. **RIC <-> SMF self-connect deals**: since seats.aero likely has no
