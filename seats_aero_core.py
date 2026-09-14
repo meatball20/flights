@@ -364,6 +364,14 @@ def explode_rows(raw_rows):
             if not row.get(f"{cabin_code}Available"):
                 continue
             miles = row.get(f"{cabin_code}MileageCostRaw")
+            if miles is None:
+                # Seats.aero's cached data occasionally marks a cabin
+                # available with no actual mileage cost attached (a data
+                # gap on their end, not ours). There's no usable price to
+                # show or compare here, so skip it rather than let a later
+                # None + number crash a report that does direct math on
+                # miles (report 4's total-cost ranking, for example).
+                continue
             seats = row.get(f"{cabin_code}RemainingSeats")
             taxes_cents = row.get(f"{cabin_code}TotalTaxes")
             nonstop = row.get(f"{cabin_code}Direct")
